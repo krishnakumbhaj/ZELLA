@@ -1,0 +1,17 @@
+[
+  {
+    "prompt": "Thank a recruiter for scheduling an interview",
+    "subject": "Thank You for the Interview Opportunity",
+    "body": "Dear [Recruiter's Name],\n\nThank you for scheduling my interview for the [Position Name] role at [Company Name]. I appreciate the opportunity and look forward to speaking with the team.\n\nWarm regards,\n[Your Name]"
+  },
+  {
+    "prompt": "Request for project deadline extension",
+    "subject": "Request for Project Deadline Extension",
+    "body": "Dear [Manager's Name],\n\nI hope this message finds you well. Due to unforeseen circumstances, I would like to request an extension on the deadline for [Project Name]. I believe an additional [X days] will allow me to deliver a higher-quality result.\n\nThank you for your understanding.\nBest,\n[Your Name]"
+  },
+  {
+    "prompt": "Follow-up after networking event",
+    "subject": "Great Connecting at the Event",
+    "body": "Hi [Name],\n\nIt was a pleasure meeting you at [Event Name]. I enjoyed our conversation about [Topic]. Let’s stay in touch — I’d love to connect further about opportunities in [Industry/Field].\n\nWarm regards,\n[Your Name]"
+  }
+]

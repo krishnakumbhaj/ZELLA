@@ -1,0 +1,15 @@
+# LangChain core and integrations
+langchain
+langchain-community
+langchain-google-genai
+
+# Gemini API
+google-generativeai
+
+# Gmail API libraries
+google-api-python-client
+google-auth
+google-auth-oauthlib
+
+# General tools
+python-dotenv
