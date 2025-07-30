@@ -1,24 +1,169 @@
 import os
 import re
 import json
+import pickle
 import streamlit as st
 from datetime import datetime
 from dotenv import load_dotenv
+import base64
+from email.mime.text import MIMEText
+
+# Google Auth imports
+from google.auth.transport.requests import Request
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from langchain_core.output_parsers import StrOutputParser
 
-from agent.email_agent import send_email_with_ai
-from gmail.auth import authenticate_gmail
-from gmail.read_emails import get_unread_emails
-
 # Load .env variables
 load_dotenv()
 api_key = os.getenv("GOOGLE_API_KEY")
 
+# Gmail API scopes
+SCOPES = ['https://www.googleapis.com/auth/gmail.readonly', 
+          'https://www.googleapis.com/auth/gmail.send']
+
 # File path for saving chat history
 CHAT_HISTORY_FILE = "chat_history.json"
+
+# Gmail Authentication Functions
+def authenticate_gmail():
+    """Authenticate and return Gmail service object"""
+    creds = None
+    
+    # The file token.pickle stores the user's access and refresh tokens.
+    if os.path.exists('token.pickle'):
+        with open('token.pickle', 'rb') as token:
+            creds = pickle.load(token)
+    
+    # If there are no (valid) credentials available, let the user log in.
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            try:
+                creds.refresh(Request())
+            except Exception as e:
+                st.warning(f"Token refresh failed: {e}")
+                # Delete the invalid token file
+                if os.path.exists('token.pickle'):
+                    os.remove('token.pickle')
+                creds = None
+        
+        if not creds:
+            # Check if credentials.json exists
+            if not os.path.exists('credentials.json'):
+                raise FileNotFoundError(
+                    "credentials.json not found. Please download it from Google Cloud Console."
+                )
+            
+            try:
+                flow = InstalledAppFlow.from_client_secrets_file(
+                    'credentials.json', SCOPES)
+                creds = flow.run_local_server(port=0)
+            except Exception as e:
+                raise Exception(f"OAuth flow failed: {e}")
+        
+        # Save the credentials for the next run
+        with open('token.pickle', 'wb') as token:
+            pickle.dump(creds, token)
+    
+    return build('gmail', 'v1', credentials=creds)
+
+def get_unread_emails(service, max_results=5):
+    """Get unread emails from Gmail"""
+    try:
+        # Get unread messages
+        results = service.users().messages().list(
+            userId='me', 
+            q='is:unread',
+            maxResults=max_results
+        ).execute()
+        
+        messages = results.get('messages', [])
+        
+        if not messages:
+            return []
+        
+        email_list = []
+        
+        for message in messages:
+            try:
+                # Get message details
+                msg = service.users().messages().get(
+                    userId='me', 
+                    id=message['id'],
+                    format='full'
+                ).execute()
+                
+                # Extract email data
+                headers = msg['payload'].get('headers', [])
+                
+                # Get sender, subject, and date
+                sender = next((h['value'] for h in headers if h['name'] == 'From'), 'Unknown')
+                subject = next((h['value'] for h in headers if h['name'] == 'Subject'), 'No Subject')
+                date = next((h['value'] for h in headers if h['name'] == 'Date'), 'Unknown')
+                
+                # Get email snippet
+                snippet = msg.get('snippet', 'No preview available')
+                
+                email_list.append({
+                    'sender': sender,
+                    'subject': subject,
+                    'date': date,
+                    'snippet': snippet,
+                    'id': message['id']
+                })
+                
+            except Exception as e:
+                st.warning(f"Error processing message: {e}")
+                continue
+        
+        return email_list
+        
+    except HttpError as error:
+        st.error(f"Gmail API error: {error}")
+        return []
+    except Exception as e:
+        st.error(f"Error fetching emails: {e}")
+        return []
+
+def send_email_with_gmail(service, to_email, subject, body):
+    """Send email using Gmail API"""
+    try:
+        # Create message
+        message = MIMEText(body)
+        message['to'] = to_email
+        message['subject'] = subject
+        
+        # Encode message
+        raw_message = base64.urlsafe_b64encode(message.as_bytes()).decode('utf-8')
+        
+        # Send email
+        send_message = service.users().messages().send(
+            userId='me',
+            body={'raw': raw_message}
+        ).execute()
+        
+        return f"Email sent successfully! Message ID: {send_message['id']}"
+        
+    except HttpError as error:
+        return f"Gmail API error: {error}"
+    except Exception as e:
+        return f"Error sending email: {e}"
+
+def test_gmail_connection(service):
+    """Test Gmail API connection"""
+    try:
+        if service:
+            # Try to get user profile
+            profile = service.users().getProfile(userId='me').execute()
+            return f"✅ Connected as: {profile.get('emailAddress')}"
+        else:
+            return "❌ Gmail service not initialized"
+    except Exception as e:
+        return f"❌ Connection test failed: {str(e)}"
 
 # Chat persistence functions
 def load_chat_history():
@@ -84,7 +229,7 @@ def save_current_session():
 
 # Page configuration
 st.set_page_config(
-    page_title="Vecna Assistant",
+    page_title="ZELLA",
     page_icon="🤖",
     layout="wide"
 )
@@ -105,16 +250,47 @@ if "message_history" not in st.session_state:
     ]
 
 if "llm" not in st.session_state:
+    if not api_key:
+        st.error("❌ GOOGLE_API_KEY not found in environment variables!")
+        st.stop()
     st.session_state.llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", google_api_key=api_key)
 
 if "parser" not in st.session_state:
     st.session_state.parser = StrOutputParser()
 
+# Gmail service initialization with better error handling
 if "gmail_service" not in st.session_state:
     try:
-        st.session_state.gmail_service = authenticate_gmail()
+        # Check for credentials file first
+        if not os.path.exists('credentials.json'):
+            st.error("❌ credentials.json file not found!")
+            st.info("📝 **Setup Instructions:**")
+            st.markdown("""
+            1. Go to [Google Cloud Console](https://console.cloud.google.com/)
+            2. Create a new project or select existing one
+            3. Enable Gmail API
+            4. Create OAuth 2.0 credentials (Desktop Application)
+            5. Download the credentials.json file
+            6. Place it in your app's root directory
+            7. Restart the application
+            """)
+            st.session_state.gmail_service = None
+        else:
+            with st.spinner("🔐 Authenticating with Gmail..."):
+                st.session_state.gmail_service = authenticate_gmail()
+            st.success("✅ Gmail authentication successful!")
+    except FileNotFoundError as e:
+        st.error(f"❌ Missing credentials file: {e}")
+        st.session_state.gmail_service = None
     except Exception as e:
-        st.error(f"Gmail authentication failed: {e}")
+        st.error(f"❌ Gmail authentication failed: {e}")
+        st.info("💡 **Troubleshooting:**")
+        st.markdown("""
+        - Try deleting `token.pickle` file and restart
+        - Ensure Gmail API is enabled in Google Cloud Console
+        - Check if your email is added as a test user
+        - Verify credentials.json is valid
+        """)
         st.session_state.gmail_service = None
 
 # Email approval session states
@@ -139,59 +315,85 @@ def generate_email_with_ai(user_input):
         
         Please analyze the request and generate a professional email. Return ONLY a valid JSON object with these fields:
         {{
-            "to": "recipient email address (extract or ask for clarification if missing)",
+            "to": "recipient email address (extract from the request)",
             "subject": "appropriate email subject line",
             "body": "complete, well-formatted email body with proper greeting, content, and closing"
         }}
         
         Guidelines for email generation:
-        1. If recipient is not clear, use "RECIPIENT_NEEDED" as placeholder
+        1. Extract the recipient email address from the request
         2. Create an appropriate subject line based on the content
         3. Write a complete, professional email body including:
            - Proper greeting (Dear [Name]/Hello/Hi)
            - Main content based on user's request
            - Appropriate closing (Best regards, Thank you, etc.)
            - Professional tone unless specified otherwise
-        4. If the request lacks specific details, create reasonable content while keeping it professional
-        5. Make the email complete and ready to send
+        4. Make the email complete and ready to send
         
-        Return only the JSON object, no additional text.
+        IMPORTANT: Return ONLY the JSON object with no additional text or formatting.
         """
         
         # Get AI response for email generation
         generation_response = st.session_state.llm.invoke([HumanMessage(content=email_generation_prompt)])
         generated_text = st.session_state.parser.invoke(generation_response)
         
+        # Clean up the response - remove markdown formatting if present
+        clean_text = generated_text.strip()
+        if clean_text.startswith("```json"):
+            clean_text = clean_text[7:]
+        if clean_text.endswith("```"):
+            clean_text = clean_text[:-3]
+        clean_text = clean_text.strip()
+        
         # Try to parse JSON from response
         try:
             # Look for JSON in the response
-            json_start = generated_text.find('{')
-            json_end = generated_text.rfind('}') + 1
+            json_start = clean_text.find('{')
+            json_end = clean_text.rfind('}') + 1
             if json_start != -1 and json_end > json_start:
-                json_str = generated_text[json_start:json_end]
+                json_str = clean_text[json_start:json_end]
                 email_details = json.loads(json_str)
                 
                 # Validate that we have the required fields
-                if not email_details.get('to') or email_details.get('to') == 'RECIPIENT_NEEDED':
-                    return None, "⚠️ Please specify the recipient email address. Who should receive this email?"
+                if not email_details.get('to'):
+                    return None, "⚠️ Could not determine recipient email address. Please specify who should receive this email."
                 
                 if not email_details.get('subject'):
-                    return None, "⚠️ Could not generate appropriate subject. Please specify the email subject."
+                    email_details['subject'] = "Message from ZELLA Assistant"  # Default subject
                 
                 if not email_details.get('body'):
                     return None, "⚠️ Could not generate email content. Please provide more details about what you want to say."
                 
                 return email_details, None
             else:
-                return None, "Could not generate email. Please provide more specific details about the recipient, subject, and what you want to communicate."
+                # Try direct JSON parsing if no braces found in substring
+                try:
+                    email_details = json.loads(clean_text)
+                    return email_details, None
+                except:
+                    return None, "Could not parse email response. Please try rephrasing your request."
         except json.JSONDecodeError as e:
-            return None, f"Error processing email generation. Please try rephrasing your request. Details: {str(e)}"
+            return None, f"Error processing email generation. Please try rephrasing your request."
     except Exception as e:
         return None, f"Error generating email: {str(e)}"
 
 def is_email_request(text: str) -> bool:
-    keywords = ["send email", "mail to", "write email", "send a mail", "compose email", "email to"]
-    return any(k in text.lower() for k in keywords)
+    """Enhanced email request detection"""
+    text_lower = text.lower()
+    email_keywords = [
+        "send email", "mail to", "write email", "send a mail", 
+        "compose email", "email to", "send an email", "email",
+        "write a mail", "compose a mail"
+    ]
+    
+    # Check for keywords
+    keyword_match = any(keyword in text_lower for keyword in email_keywords)
+    
+    # Check for email address pattern
+    email_pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
+    has_email = bool(re.search(email_pattern, text))
+    
+    return keyword_match or (has_email and any(word in text_lower for word in ["send", "mail", "write"]))
 
 def is_read_email_request(text: str) -> bool:
     text = re.sub(r"[^\w\s]", "", text.lower())
@@ -285,41 +487,51 @@ def process_chatbot_input(user_input):
         except Exception as e:
             return f"❌ Modification error: {str(e)}", "error"
 
-    # Handle email reading (same logic as your chatbot)
-    if is_read_email_request(user_input):
+    # Handle email reading
+    elif is_read_email_request(user_input):
         try:
-            emails = get_unread_emails()
+            if not st.session_state.gmail_service:
+                return "❌ Gmail service not available. Please check authentication.", "error"
+            
+            emails = get_unread_emails(st.session_state.gmail_service)
             if emails:
-                return emails, "emails"  # Return raw email data for special formatting
+                return emails, "emails"
             else:
                 return "📭 No unread emails found.", "info"
         except Exception as e:
             return f"❌ Error reading emails: {e}", "error"
 
-    # Normal Gemini QA response (same logic as your chatbot)
-    update_history("user", user_input)
-    try:
-        raw_response = st.session_state.llm.invoke(st.session_state.message_history)
-        parsed_answer = st.session_state.parser.invoke(raw_response)
-        update_history("ai", parsed_answer)
-        return f"Vecna: {parsed_answer}", "ai"
-    except Exception as e:
-        error_msg = f"⚠️ Vecna error: {e}"
-        return error_msg, "error"
+    # Normal Gemini QA response
+    else:
+        update_history("user", user_input)
+        try:
+            raw_response = st.session_state.llm.invoke(st.session_state.message_history)
+            parsed_answer = st.session_state.parser.invoke(raw_response)
+            update_history("ai", parsed_answer)
+            return f"ZELLA: {parsed_answer}", "ai"
+        except Exception as e:
+            error_msg = f"⚠️ ZELLA error: {e}"
+            return error_msg, "error"
 
 def send_approved_email():
     """Send the approved email"""
     try:
+        if not st.session_state.gmail_service:
+            return "❌ Gmail service not available. Please check authentication."
+        
         if st.session_state.pending_email:
-            # Format the email request for the existing send_email_with_ai function
-            email_request = f"Send email to {st.session_state.pending_email['to']} with subject '{st.session_state.pending_email['subject']}' and message: {st.session_state.pending_email['body']}"
-            result = send_email_with_ai(email_request)
+            result = send_email_with_gmail(
+                st.session_state.gmail_service,
+                st.session_state.pending_email['to'],
+                st.session_state.pending_email['subject'],
+                st.session_state.pending_email['body']
+            )
             
             # Reset email preview mode
             st.session_state.pending_email = None
             st.session_state.email_preview_mode = False
             
-            return f"✅ Email sent successfully! {result}"
+            return f"✅ {result}"
         else:
             return "❌ No pending email to send."
     except Exception as e:
@@ -334,74 +546,87 @@ def cancel_email():
 def streamlit_chatbot():
     """Streamlit version of your chatbot function"""
     
-    st.title("Vecna")
+    st.title("🤖 ZELLA")
     st.markdown("Ask anything, send emails, or read your inbox!")
     
-    # Email preview banner - MOVED TO TOP AND MADE MORE PROMINENT
-    if st.session_state.email_preview_mode and st.session_state.pending_email:
-        # Create a prominent warning/info section
-        st.warning("📧 **EMAIL PREVIEW MODE** - Please review the email below before sending!")
-        
-        # Create a well-defined container for email preview
+    # Gmail Status Banner
+    if st.session_state.gmail_service:
         with st.container():
-            st.markdown("### 📧 Email Preview")
+            col1, col2 = st.columns([3, 1])
+            with col1:
+                st.success("🔗 Gmail Connected - Email features available!")
+            with col2:
+                if st.button("🧪 Test Connection"):
+                    result = test_gmail_connection(st.session_state.gmail_service)
+                    st.info(result)
+    else:
+        st.warning("⚠️ Gmail not connected - Email features disabled")
+    
+    # Email preview banner - ENHANCED VERSION
+    if st.session_state.email_preview_mode and st.session_state.pending_email:
+        # Create a very prominent alert
+        st.error("🚨 EMAIL PREVIEW MODE - PLEASE REVIEW BEFORE SENDING! 🚨")
+        
+        # Create a container with colored background
+        with st.container():
+            st.markdown("### 📧 Email Ready for Review")
             
-            # Create a nice bordered section for email details
-            with st.expander("📨 **Email Details** (Click to expand/collapse)", expanded=True):
-                
-                # Recipient
-                st.markdown("**📨 To:**")
-                st.info(st.session_state.pending_email.get('to', 'Not specified'))
-                
-                # Subject  
-                st.markdown("**📋 Subject:**")
-                st.info(st.session_state.pending_email.get('subject', 'Not specified'))
-                
-                # Email body
-                st.markdown("**📄 Complete Email Message:**")
-                email_body = st.session_state.pending_email.get('body', 'Not specified')
-                
-                # Display email body in a nice text area
-                st.text_area(
-                    label="Email Content:",
-                    value=email_body, 
-                    height=250, 
-                    disabled=True,
-                    help="This is the complete email that will be sent including greeting, message, and closing",
-                    key="email_body_preview"
-                )
-                
-            # Action buttons - make them more prominent
-            st.markdown("### 🎯 Actions")
-            col1, col2, col3, col4 = st.columns([1, 1, 1, 1])
+            # Create columns for better layout
+            col1, col2 = st.columns([2, 1])
             
             with col1:
-                if st.button("✅ **SEND EMAIL**", type="primary", use_container_width=True):
+                # Email details in an info box
+                st.info(f"**📨 To:** {st.session_state.pending_email.get('to', 'Unknown')}")
+                st.info(f"**📋 Subject:** {st.session_state.pending_email.get('subject', 'Unknown')}")
+                
+                # Email body in a text area
+                st.markdown("**📄 Complete Email Message:**")
+                email_body = st.session_state.pending_email.get('body', 'No content')
+                
+                st.text_area(
+                    label="Email Content Preview:",
+                    value=email_body,
+                    height=200,
+                    disabled=True,
+                    key="email_preview_display"
+                )
+            
+            with col2:
+                st.markdown("### 🎯 Actions")
+                
+                # Send button - make it prominent
+                if st.button("✅ **SEND EMAIL**", type="primary", use_container_width=True, key="send_email_btn"):
                     result = send_approved_email()
                     st.session_state.messages.append({"role": "assistant", "content": result})
                     save_current_session()
                     st.rerun()
-            
-            with col2:
-                if st.button("❌ **CANCEL**", use_container_width=True):
+                
+                # Cancel button
+                if st.button("❌ **CANCEL**", use_container_width=True, key="cancel_email_btn"):
                     result = cancel_email()
                     st.session_state.messages.append({"role": "assistant", "content": result})
                     save_current_session()
                     st.rerun()
-            
-            with col3:
+                
+                st.markdown("---")
                 st.markdown("**💡 Need Changes?**")
-                st.caption("Type modifications in chat below")
-            
-            with col4:
-                st.markdown("**📝 Examples:**")
-                st.caption("'Make it more formal', 'Change subject', 'Add more details'")
+                st.caption("Type modifications in the chat below")
+                st.markdown("**Examples:**")
+                st.caption("• 'Make it more formal'")
+                st.caption("• 'Change the subject'")
+                st.caption("• 'Add more details'")
         
         st.markdown("---")
     
     # Sidebar with chat history and controls
     with st.sidebar:
         st.header("💬 Chat History")
+        
+        # Gmail connection status in sidebar
+        if st.session_state.gmail_service:
+            st.success("✅ Gmail Connected")
+        else:
+            st.error("❌ Gmail Disconnected")
         
         # New Chat button
         col1, col2 = st.columns([1, 1])
@@ -486,18 +711,6 @@ def streamlit_chatbot():
                     st.divider()
         else:
             st.info("No saved chats yet. Start chatting and save your conversations!")
-        
-        # Download chat history
-        st.markdown("---")
-        st.header("📥 Export")
-        if st.button("📄 Download All Chats"):
-            chat_data = load_chat_history()
-            st.download_button(
-                label="💾 Download JSON",
-                data=json.dumps(chat_data, indent=2, ensure_ascii=False),
-                file_name=f"vecna_chat_history_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
-                mime="application/json"
-            )
 
     # Display chat messages
     for message in st.session_state.messages:
@@ -522,17 +735,21 @@ def streamlit_chatbot():
             with st.spinner("Processing..."):
                 response, response_type = process_chatbot_input(prompt)
             
-            # Handle email preview - SIMPLIFIED MESSAGE
+            # Handle email preview
             if response_type == "email_preview" and isinstance(response, dict):
                 success_msg = "✅ **Email Generated Successfully!** Please review the email preview above and click 'SEND EMAIL' when ready."
                 st.markdown(success_msg)
                 st.session_state.messages.append({"role": "assistant", "content": success_msg})
+                # Force UI refresh to show preview
+                st.rerun()
             
-            # Handle email modification - SIMPLIFIED MESSAGE  
+            # Handle email modification
             elif response_type == "email_preview" and st.session_state.email_preview_mode:
                 modification_msg = "✅ **Email Updated!** Please review the changes in the preview above."
                 st.markdown(modification_msg)
                 st.session_state.messages.append({"role": "assistant", "content": modification_msg})
+                # Force UI refresh to show updated preview
+                st.rerun()
             
             # Special formatting for emails
             elif response_type == "emails" and isinstance(response, list):
@@ -573,14 +790,74 @@ def streamlit_chatbot():
 
     # Footer
     st.markdown("---")
+    st.markdown("**🔧 Quick Actions:**")
+    col1, col2, col3, col4 = st.columns(4)
     
+    with col1:
+        if st.button("📧 Check Emails", use_container_width=True):
+            if st.session_state.gmail_service:
+                with st.spinner("Fetching emails..."):
+                    emails = get_unread_emails(st.session_state.gmail_service)
+                    if emails:
+                        st.session_state.messages.append({"role": "user", "content": "Check my emails"})
+                        formatted_response = f"📬 Found {len(emails)} unread emails"
+                        st.session_state.messages.append({"role": "assistant", "content": formatted_response})
+                        save_current_session()
+                        st.rerun()
+                    else:
+                        st.info("📭 No unread emails found.")
+            else:
+                st.error("❌ Gmail not connected")
+    
+    with col2:
+        if st.button("🆕 Quick Email", use_container_width=True):
+            st.session_state.messages.append({"role": "user", "content": "Help me compose an email"})
+            response = "📝 I'll help you compose an email! Please tell me:\n\n1. **Who** should receive it (email address)\n2. **What** is the subject\n3. **What** message you want to send\n\nYou can say something like: 'Send an email to john@example.com about the meeting tomorrow'"
+            st.session_state.messages.append({"role": "assistant", "content": response})
+            save_current_session()
+            st.rerun()
+    
+    with col3:
+        if st.button("🔄 Refresh Gmail", use_container_width=True):
+            try:
+                if os.path.exists('token.pickle'):
+                    os.remove('token.pickle')
+                    st.session_state.gmail_service = None
+                    st.info("🔄 Gmail token refreshed. Please restart the app.")
+                else:
+                    st.info("ℹ️ No token file found to refresh.")
+            except Exception as e:
+                st.error(f"❌ Error refreshing token: {e}")
+    
+    with col4:
+        if st.button("ℹ️ Help", use_container_width=True):
+            help_text = """
+            **🤖 ZELLA Help Guide**
+            
+            **📧 Email Commands:**
+            - "Send email to john@example.com about meeting"
+            - "Read my emails" or "Check inbox"
+            - "Compose email to team about project update"
+            
+            **💬 Chat Features:**
+            - Ask any question
+            - Get help with tasks
+            - Generate content
+            
+            **🔧 Setup Requirements:**
+            - credentials.json from Google Cloud Console
+            - Gmail API enabled
+            - GOOGLE_API_KEY in .env file
+            
+            **🚨 Email Preview:**
+            - All emails are previewed before sending
+            - You can modify emails before sending
+            - Use "Make it more formal" or "Change subject" to modify
+            """
+            st.session_state.messages.append({"role": "user", "content": "Show help"})
+            st.session_state.messages.append({"role": "assistant", "content": help_text})
+            save_current_session()
+            st.rerun()
 
 if __name__ == "__main__":
-    # Check if running in Streamlit
-    try:
-        # This will work when running with streamlit run main.py
-        streamlit_chatbot()
-    except:
-        # Fallback to original chatbot for terminal use
-        from bot.chatbot import chatbot
-        chatbot()
+    streamlit_chatbot()
